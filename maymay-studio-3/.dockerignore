@@ -1,0 +1,12 @@
+.git
+.venv
+node_modules
+frontend/node_modules
+frontend/dist
+data
+*.db*
+.env*
+.preview-public-url
+__pycache__
+.pytest_cache
+*.zip

@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: maymay
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: local-only-password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U studio -d maymay]
+      interval: 5s
+      retries: 15
+  web:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      STUDIO_ENV: development
+      PUBLIC_URL: http://localhost:8000
+      DATABASE_URL: postgresql+psycopg://studio:local-only-password@postgres:5432/maymay
+      DATA_DIR: /data
+      ADMIN_PASSWORD: maymay-local
+      SECRET_KEY: local-compose-persistent-secret-keep-this-stable
+    volumes: ["media:/data"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+volumes:
+  pgdata:
+  media:

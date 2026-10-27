@@ -1,0 +1,1 @@
+{"name":"maymay-studio-3","private":true,"scripts":{"dev":"python3 scripts/dev.py","build":"npm --prefix frontend run build"}}

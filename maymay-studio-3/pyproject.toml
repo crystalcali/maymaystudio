@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "maymay-studio"
+version = "3.0.0"
+requires-python = ">=3.12,<3.13"
+dynamic = ["dependencies"]
+[tool.setuptools.dynamic]
+dependencies = {file = "requirements.txt"}
+[tool.setuptools.packages.find]
+include = ["maymay*", "agent*"]
+[tool.setuptools.package-data]
+maymay = ["*.json"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

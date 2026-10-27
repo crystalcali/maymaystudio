@@ -1,0 +1,1 @@
+"""Outgoing-only GPU worker."""

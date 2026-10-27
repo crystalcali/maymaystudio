@@ -1,0 +1,5 @@
+# Explicit additions to the pinned Musubi pyproject. Validate on CUDA before recommendation.
+bitsandbytes==0.50.2
+numpy==2.2.6
+torch==2.10.0
+torchvision==0.25.0
