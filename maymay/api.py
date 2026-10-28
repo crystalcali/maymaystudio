@@ -57,7 +57,12 @@ def create_app(settings=None):
         if request.url.path.startswith(('/api','/worker')):response.headers['Cache-Control']='no-store'
         return response
     @app.exception_handler(ProviderError)
-    async def provider_error(_,e):return JSONResponse({'detail':str(e)},502)
+    async def provider_error(_,e):
+        logger = __import__('logging').getLogger(__name__)
+        logger.warning('YouGPU operation=%s status=%s uncertain=%s',e.operation_id,e.status_code,e.uncertain)
+        with Session.begin() as record:
+            record.add(KV(key='provider-error:'+e.operation_id,value={**e.detail(),'created':time.time()}))
+        return JSONResponse({'detail':e.detail()},502)
     @app.exception_handler(ValueError)
     async def value_error(_,e):return JSONResponse({'detail':str(e)},400)
 
@@ -154,12 +159,33 @@ def create_app(settings=None):
     def profile_save(id:str,body:dict,session=Depends(db)):
         p=session.get(Profile,id)
         family=body.get('family',p.family if p else '')
+        if p and family!=p.family:raise ValueError('Нельзя менять архитектуру существующего профиля; создайте копию')
         if family not in PROFILES:raise ValueError('Unknown family')
         components=body.get('components',{})
         if not isinstance(components,dict):raise ValueError('Components must be an object')
+        for key,spec in components.items():
+            if isinstance(spec,str):
+                if not spec.startswith('/'):raise ValueError('Путь компонента должен быть абсолютным: '+key)
+            elif not isinstance(spec,dict) or not (spec.get('path') or spec.get('repo')):
+                raise ValueError('Компонент '+key+': укажите repo или абсолютный path')
+            elif spec.get('path') and not str(spec['path']).startswith('/'):raise ValueError('Путь компонента должен быть абсолютным: '+key)
         if not p:p=Profile(id=id,name=body.get('name',id)[:160],family=family);session.add(p)
         p.components=components;p.name=body.get('name',p.name)[:160]
         session.commit();return asdict(p)
+    @app.delete('/api/profiles/{id}',dependencies=[Depends(admin)])
+    def profile_delete(id:str,confirm:bool=False,session=Depends(db)):
+        p=get_or_404(session,Profile,id)
+        if id in PROFILES:raise ValueError('Системный профиль нельзя удалить; используйте копию')
+        if not confirm:raise ValueError('Подтвердите необратимое удаление профиля')
+        if any(j.params.get('profile_id')==id for j in session.scalars(select(Job))):
+            raise ValueError('Профиль используется в истории заданий. Сначала удалите зависимые задания')
+        session.delete(p);session.commit();return {'ok':True}
+    @app.post('/api/profiles/{id}/copy',dependencies=[Depends(admin)])
+    def profile_copy(id:str,body:dict,session=Depends(db)):
+        from copy import deepcopy
+        p=get_or_404(session,Profile,id)
+        new=Profile(name=str(body.get('name',p.name+' · копия'))[:160],family=p.family,components=deepcopy(p.components))
+        session.add(new);session.commit();return asdict(new)
     @app.post('/api/profiles/{id}/reset',dependencies=[Depends(admin)])
     def profile_reset(id:str,session=Depends(db)):
         p=get_or_404(session,Profile,id);p.components=PROFILES[p.family];session.commit();return asdict(p)
@@ -205,6 +231,44 @@ def create_app(settings=None):
     @app.post('/api/datasets',dependencies=[Depends(admin)])
     def dataset_create(body:dict,session=Depends(db)):
         get_or_404(session,Character,body['character_id']);d=Dataset(name=str(body.get('name','Dataset'))[:160],character_id=body['character_id']);session.add(d);session.commit();return asdict(d)
+    def dataset_idle(session,id):
+        if any(j.params.get('dataset_id')==id and j.status not in TERMINAL for j in session.scalars(select(Job))):
+            raise ValueError('Датасет используется активным заданием. Отмените его и дождитесь завершения')
+    @app.get('/api/datasets/{id}/settings',dependencies=[Depends(admin)])
+    def dataset_settings(id:str,session=Depends(db)):
+        d=get_or_404(session,Dataset,id);row=session.get(KV,'dataset-settings:'+id)
+        return {'material':'image','caption_rules':'Describe variable properties in English','resolution':1024,'selection':'manual','validation_ratio':.15,
+                **(row.value if row else {}),'character_id':d.character_id,'trigger':session.get(Character,d.character_id).trigger}
+    @app.put('/api/datasets/{id}/settings',dependencies=[Depends(admin)])
+    def dataset_settings_save(id:str,body:dict,session=Depends(db)):
+        get_or_404(session,Dataset,id);dataset_idle(session,id)
+        value={k:body[k] for k in ('material','caption_rules','resolution','selection','validation_ratio') if k in body}
+        if value.get('material','image') not in ('image','video','mixed'):raise ValueError('Тип материала: image/video/mixed')
+        if value.get('selection','manual') not in ('manual','exclude_duplicates'):raise ValueError('Неизвестная стратегия отбора')
+        if not 0<=float(value.get('validation_ratio',.15))<=.5:raise ValueError('Validation split: 0–0.5')
+        if type(value.get('resolution',1024)) is not int or not 256<=value.get('resolution',1024)<=2048:raise ValueError('Разрешение: 256–2048')
+        key='dataset-settings:'+id;row=session.get(KV,key)
+        if row:row.value={**row.value,**value}
+        else:session.add(KV(key=key,value=value))
+        session.commit();return dataset_settings(id,session)
+    @app.get('/api/datasets/{id}/versions',dependencies=[Depends(admin)])
+    def dataset_versions(id:str,session=Depends(db)):
+        get_or_404(session,Dataset,id)
+        return [{**r.value,'url':storage.url(r.value['key'],True)} for r in session.scalars(select(KV).where(KV.key.startswith('snapshot:'+id+':')))]
+    @app.delete('/api/datasets/{id}',dependencies=[Depends(admin)])
+    def dataset_delete(id:str,confirm:bool=False,session=Depends(db)):
+        d=get_or_404(session,Dataset,id);dataset_idle(session,id)
+        if not confirm:raise ValueError('Подтвердите необратимое удаление датасета')
+        session.execute(delete(Item).where(Item.dataset_id==id));session.delete(d)
+        # Retain immutable snapshots and source objects. Shared artifact/job keys must
+        # never be destroyed by deleting an editing collection. GC is separate.
+        session.commit();return {'ok':True,'objects_retained':True}
+    @app.delete('/api/items/{id}',dependencies=[Depends(admin)])
+    def item_delete(id:str,confirm:bool=False,session=Depends(db)):
+        i=get_or_404(session,Item,id);dataset_idle(session,i.dataset_id)
+        if not confirm:raise ValueError('Подтвердите удаление файла из набора')
+        session.get(Dataset,i.dataset_id).revision+=1;session.delete(i);session.commit()
+        return {'ok':True,'objects_retained':True}
     @app.get('/api/datasets/{id}/items',dependencies=[Depends(admin)])
     def dataset_items(id:str,session=Depends(db)):
         get_or_404(session,Dataset,id)
@@ -237,9 +301,11 @@ def create_app(settings=None):
         session.add(i);d.revision+=1;session.commit();return asdict(i)
     @app.post('/api/datasets/{id}/snapshot',dependencies=[Depends(admin)])
     def dataset_snapshot(id:str,body:dict,session=Depends(db)):
-        ratio=float(body.get('validation_ratio',.15))
+        settings=dataset_settings(id,session)
+        ratio=float(body.get('validation_ratio',settings['validation_ratio']))
         if not 0<=ratio<=.5:raise ValueError('Validation ratio: 0–0.5')
         result=snapshot(session,storage,get_or_404(session,Dataset,id),ratio)
+        session.commit()
         return {**result,'url':storage.url(result['key'],True)}
     @app.post('/api/uploads',dependencies=[Depends(admin)])
     async def upload_reference(file:UploadFile=File(...),session=Depends(db)):
@@ -279,19 +345,23 @@ def create_app(settings=None):
         char=get_or_404(session,Character,body.get('character_id','may'))
         params['trigger']=char.trigger
         if recipe['kind']!='prepare':
-            profile=get_or_404(session,Profile,body.get('profile_id',recipe['family']))
-            if profile.family!=recipe['family']:raise ValueError('Profile family mismatch')
+            profile=session.get(Profile,body.get('profile_id') or params.get('profile_id') or recipe['family'])
+            if not profile:raise ValueError('Профиль модели не найден. Создайте или выберите профиль в разделе «Модели и LoRA»')
+            if profile.family!=recipe['family']:raise ValueError('Архитектура профиля несовместима с выбранным пайплайном')
             params['components']=profile.components;params['profile_id']=profile.id
             # Every cloud model revision must be pinned before paid work.
             required=['raw','vae','text_encoder'] if rid=='krea.train' else ['dit','vae','text_encoder'] if recipe['family'] in ('krea2','klein9') else ['pipeline'] if recipe['family']=='wan22-5b' else ['low','high','vae','text_encoder']
             for key in required:
                 spec=profile.components.get(key)
-                if not spec:raise ValueError('Missing component '+key)
-                if isinstance(spec,dict) and not spec.get('path') and spec.get('revision','main')=='main':raise ValueError('Open Models and run component check to pin model revisions first')
+                if not spec:raise ValueError('Отсутствует компонент модели: '+key+'. Заполните профиль')
+                if not isinstance(spec,(dict,str)):raise ValueError('Некорректный компонент '+key)
+                if isinstance(spec,dict) and not spec.get('path') and not re.fullmatch('[a-fA-F0-9]{40}',str(spec.get('revision',''))):raise ValueError('Не закреплена ревизия модели. В «Модели и LoRA» нажмите «Проверить доступ»')
         if recipe['kind']=='train':
             ds=get_or_404(session,Dataset,params.get('dataset_id',''))
             if ds.character_id!=char.id:raise ValueError('Dataset belongs to another character')
-            params['snapshot']=snapshot(session,storage,ds)
+            ds_settings=dataset_settings(ds.id,session)
+            params['dataset_settings']=ds_settings
+            params['snapshot']=snapshot(session,storage,ds,ds_settings['validation_ratio'])
             if recipe['family'] in ('krea2','klein9') and 'video' in params['snapshot']['kinds']:raise ValueError('Image trainer requires an image-only dataset')
             params['validation_prompt']=params.get('validation_prompt',f'{char.trigger}, woman, candid photo, standing in a bookshop, natural lighting')
             if params.get('resume_artifact'):
@@ -310,6 +380,7 @@ def create_app(settings=None):
                 params['caption_model']=report['components']['caption_model']['spec']
             ds=get_or_404(session,Dataset,params.get('dataset_id',''))
             if ds.character_id!=char.id:raise ValueError('Dataset belongs to another character')
+            params['dataset_settings']=dataset_settings(ds.id,session)
             items=session.scalars(select(Item).where(Item.dataset_id==ds.id)).all()
             params['items']=[{'id':i.id,'key':i.key,'name':i.name,'kind':i.kind,'group_id':i.group_id,'caption':i.caption} for i in items if rid=='dataset.caption' or i.kind=='video']
             if not params['items']:raise ValueError('No suitable items in dataset')
@@ -324,7 +395,7 @@ def create_app(settings=None):
             selected.append(d)
         params['adapters']=selected
         if recipe['kind']=='generate':
-            if not params.get('prompt','').strip():raise ValueError('Describe a scene')
+            if not params.get('prompt','').strip():raise ValueError('Введите описание сцены в поле запроса')
             if rid=='wan.i2v.generate' and not params.get('reference_id'):raise ValueError('I2V requires a starting image')
             if params.get('reference_id'):
                 if not recipe.get('edit'):raise ValueError('This model does not support image input')
@@ -334,7 +405,15 @@ def create_app(settings=None):
         j=Job(recipe=rid,params=params,character_id=char.id,preferred_worker=body.get('worker_id') or None,node_id=body.get('node_id') or None)
         if j.node_id:
             node=get_or_404(session,Node,j.node_id)
-            if node.status in ('TERMINATING','TERMINATED','reconcile_required'):raise ValueError('Selected node is not available; reconcile or select another resource')
+            if node.status not in ('ACTIVE','INSTALLING','PROVISIONING','CREATING','STARTING','creating'):raise ValueError('Инстанс недоступен. Сверьте статус в разделе «Мощности»')
+        if j.preferred_worker:
+            w=get_or_404(session,Worker,j.preferred_worker)
+            if w.heartbeat<time.time()-45 or w.draining:raise ValueError('Выбранный GPU-агент недоступен или не принимает задачи')
+            if j.node_id and w.node_id!=j.node_id:raise ValueError('Агент принадлежит другому инстансу')
+            if rid not in w.capabilities.get('recipes',[]):raise ValueError('GPU-агент не поддерживает этот пайплайн')
+            if params.get('precision')=='bf16' and re.search(r'\b(T4|P100|V100|P40|GTX)\b',w.capabilities.get('gpu',''),re.I):raise ValueError('Выбранная GPU несовместима с BF16')
+        # Unassigned jobs remain queued intentionally; the UI explains this mode.
+
         session.add(j);session.commit();return job_view(j)
     @app.post('/api/jobs/{id}/cancel',dependencies=[Depends(admin)])
     def cancel_job(id:str,session=Depends(db)):
@@ -380,8 +459,10 @@ def create_app(settings=None):
     @app.get('/api/resources/catalog',dependencies=[Depends(admin)])
     def catalog(refresh:bool=False,session=Depends(db)):
         if refresh or not app.state.catalog or time.time()-app.state.catalog_at>90:
-            app.state.catalog=provider(session).catalog();app.state.catalog_at=time.time()
+            app.state.catalog=provider(session).catalog(refresh=refresh);app.state.catalog_at=time.time()
         return app.state.catalog
+    @app.get('/api/resources/balance',dependencies=[Depends(admin)])
+    def balance(session=Depends(db)):return provider(session).balance()
     @app.post('/api/resources/estimate',dependencies=[Depends(admin)])
     def estimates(body:dict,session=Depends(db)):
         params=validate_params(body['recipe'],body.get('params',{}))
@@ -394,25 +475,28 @@ def create_app(settings=None):
         return [{**asdict(n),'estimated_spend':round(n.hourly*max(0,(n.terminated or time.time())-n.created)/3600,2)} for n in session.scalars(select(Node).order_by(Node.created.desc()))]
     @app.post('/api/resources/rent',dependencies=[Depends(admin)])
     def rent(body:dict,session=Depends(db)):
-        if not s.agent_image:raise ValueError('Configure AGENT_IMAGE before renting')
+        if not s.agent_image:raise ValueError('В Timeweb задайте AGENT_IMAGE — публичный образ GPU-агента из GitHub Packages, затем повторите деплой')
         request_id=body.get('request_id','')
         if not re.fullmatch(r'[a-zA-Z0-9-]{10,64}',request_id):raise ValueError('Unique request_id required')
         existing=session.scalar(select(Node).where(Node.request_id==request_id))
         if existing:return asdict(existing)
-        offers=provider(session).catalog();offer=next((o for o in offers if o['id']==body['offer_id']),None)
-        if not offer:raise ValueError('Offer unavailable; refresh catalog')
+        offers=provider(session).catalog(refresh=True,require_live=True);offer=next((o for o in offers if o['id']==body['offer_id']),None)
+        if not offer or not offer.get('in_stock') or offer.get('stale'):raise ValueError('Предложение недоступно. Обновите каталог')
         limit=float(body.get('max_hourly',0))
         if limit<=0 or offer['hourly']>limit:raise ValueError('Hourly price exceeds your limit')
         if body.get('recipe'):
             task_params=validate_params(body['recipe'],body.get('params',{}));recipe=BY_ID[body['recipe']]
             if recipe['kind']!='prepare':
                 profile=get_or_404(session,Profile,task_params.get('profile_id') or recipe['family'])
-                if any(isinstance(c,dict) and not c.get('path') and c.get('revision','main')=='main' for c in profile.components.values()):raise ValueError('Check and pin model profile before renting GPU')
+                required=['raw','vae','text_encoder'] if body['recipe']=='krea.train' else ['dit','vae','text_encoder'] if recipe['family'] in ('krea2','klein9') else ['pipeline'] if recipe['family']=='wan22-5b' else ['low','high','vae','text_encoder']
+                if profile.family!=recipe['family'] or any(not profile.components.get(k) for k in required):raise ValueError('Заполните компоненты совместимого профиля перед арендой')
+                if any(isinstance(c,dict) and not c.get('path') and not re.fullmatch('[a-fA-F0-9]{40}',str(c.get('revision',''))) for c in profile.components.values()):raise ValueError('Перед арендой откройте профиль модели и нажмите «Проверить доступ»')
             if task_params.get('precision','bf16')=='bf16' and re.search(r'\b(T4|P100|V100|P40|GTX)\b',offer['gpu'],re.I):raise ValueError('Selected GPU is incompatible with this BF16 recipe')
         images=[i for i in offer['images'] if i.get('supports_docker')]
-        if not images:raise ValueError('No compatible Docker base image')
+        if not images:raise ValueError('Нет совместимого Docker-образа ОС')
+        if body.get('image_id') and body['image_id'] not in [i['id'] for i in images]:raise ValueError('Выберите Docker-образ из текущего предложения')
         if body.get('budget') is not None and float(body['budget'])<=0:raise ValueError('Session budget must be positive')
-        n=Node(id=uid(),request_id=request_id,name='maymay-'+request_id[:12],hourly=offer['hourly'],offer=offer,auto_terminate=bool(body.get('auto_terminate',False)),idle_minutes=max(5,int(body.get('idle_minutes',15))),budget=body.get('budget'))
+        n=Node(id=uid(),request_id=request_id,name='maymay-'+request_id,hourly=offer['hourly'],offer=offer,auto_terminate=bool(body.get('auto_terminate',False)),idle_minutes=max(5,int(body.get('idle_minutes',15))),budget=body.get('budget'))
         session.add(n);session.flush();pair=pairing(session,n.id,86400);session.commit()
         payload={'instance_name':n.name,'offer_id':offer['id'],'image_id':body.get('image_id') or images[0]['id'],
             'ssh_keys':body.get('ssh_keys',[]),'docker_config':{'image':s.agent_image,'env':[{'key':'STUDIO_URL','value':s.public_url},{'key':'PAIRING_CODE','value':pair},{'key':'WORKER_NAME','value':n.name}], 'ports':[]}}
@@ -420,6 +504,9 @@ def create_app(settings=None):
         try:
             result=provider(session).create(payload);n.provider_id=result['id'];n.status=result.get('status','PROVISIONING')
             session.commit()
+        except ProviderError as exc:
+            n.status='reconcile_required' if exc.uncertain else 'ERROR'
+            n.connection={'diagnostic':exc.detail()};session.commit();raise
         except Exception:
             n.status='reconcile_required';session.commit();raise
         return asdict(n)
@@ -427,12 +514,12 @@ def create_app(settings=None):
     def node_refresh(id:str,session=Depends(db)):
         n=get_or_404(session,Node,id)
         if not n.provider_id:
-            result=provider(session).instances();matches=[x for x in (result.get('items',[]) if isinstance(result,dict) else result) if x.get('name')==n.name]
-            if len(matches)!=1:raise ValueError('Instance creation uncertain. Check provider console; no automatic repeat rental.')
+            result=provider(session).instances();matches=[x for x in result if x.get('name')==n.name]
+            if len(matches)!=1:raise ValueError('Не найден единственный инстанс с именем '+n.name+'. Проверьте панель YouGPU и повторите сверку позже. Новую аренду не создавайте')
             n.provider_id=matches[0]['id']
         result=provider(session).instance(n.provider_id);n.status=result['status']
         # Exclude generated provider credentials from storage and browser.
-        n.connection={k:result.get(k) for k in ('ip_address','ssh_port','ssh_username','failure_reason')}
+        n.connection={k:result.get(k) for k in ('ip_address','ssh_port','ssh_username')}
         if n.status=='TERMINATED':n.terminated=time.time()
         session.commit();return asdict(n)
     @app.post('/api/resources/nodes/{id}/terminate',dependencies=[Depends(admin)])
@@ -441,7 +528,11 @@ def create_app(settings=None):
         active=session.scalar(select(Job).where(Job.node_id==id,Job.status.not_in(TERMINAL)))
         if active:raise ValueError('Cancel tasks and wait for confirmed artifact upload first')
         if not n.provider_id:raise ValueError('Reconcile provider instance ID first')
-        provider(session).terminate(n.provider_id);n.status='TERMINATING';session.commit();return asdict(n)
+        try:provider(session).terminate(n.provider_id)
+        except ProviderError as exc:
+            if exc.uncertain:n.status='reconcile_required';session.commit()
+            raise
+        n.status='TERMINATING';session.commit();return asdict(n)
 
     # Worker API: scoped credentials + lease/attempt fencing. No global provider token is sent.
     @app.post('/worker/register')
@@ -466,7 +557,7 @@ def create_app(settings=None):
         if busy:return {'job':None}
         if w.node_id:
             node=session.scalar(select(Node).where(Node.id==w.node_id).with_for_update())
-            if node and (node.status in ('TERMINATING','TERMINATED','reconcile_required') or (node.budget and node.hourly*(time.time()-node.created)/3600>=node.budget)):
+            if node and (node.status not in ('ACTIVE','INSTALLING','PROVISIONING','CREATING','STARTING','creating') or (node.budget and node.hourly*(time.time()-node.created)/3600>=node.budget)):
                 locked.draining=True;session.commit();return {'job':None}
         available=w.capabilities.get('recipes',[])
         q=select(Job).where(Job.status=='queued',Job.recipe.in_(available),((Job.preferred_worker==None)|(Job.preferred_worker==w.id)),((Job.node_id==None)|(Job.node_id==w.node_id))).order_by(Job.created).with_for_update(skip_locked=True)

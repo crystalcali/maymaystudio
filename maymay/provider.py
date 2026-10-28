@@ -5,10 +5,13 @@ A cached catalog is a display fallback, not confirmation of live availability.
 """
 
 import logging
+import math
+import uuid
 import random
 import threading
 import time
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 
@@ -16,7 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
-    pass
+    def __init__(self, message, *, status_code=None, operation_id=None, uncertain=False):
+        super().__init__(message)
+        self.status_code=status_code
+        self.operation_id=operation_id or uuid.uuid4().hex
+        self.uncertain=uncertain
+    def detail(self):
+        return {"message":str(self),"provider_status":self.status_code,
+                "operation_id":self.operation_id,"uncertain":self.uncertain}
+
 
 
 class YouGPU:
@@ -35,6 +46,7 @@ class YouGPU:
         self.key = key
 
     def request(self, method, path, payload=None, *, attempts=None, deadline=None):
+        operation_id = uuid.uuid4().hex
         method = method.upper()
         is_get = method == "GET"
         limit = (self.GET_ATTEMPTS if is_get else 1) if attempts is None else max(1, int(attempts))
@@ -55,17 +67,19 @@ class YouGPU:
                     response = client.request(method, url, headers=headers, json=payload)
                 response.raise_for_status()
                 obj = response.json()
-                if not isinstance(obj, dict) or obj.get("status") == "error" or obj.get("code", 200) >= 400:
-                    raise ProviderError(f"YouGPU rejected {method} {path}")
-                return obj.get("data", obj)
+                if not isinstance(obj, dict) or obj.get("status") == "error" or int(obj.get("code", 200)) >= 400:
+                    raise ProviderError(f"YouGPU отклонил {method} {path}", status_code=response.status_code, operation_id=operation_id, uncertain=not is_get and response.status_code>=500)
+                if "data" not in obj:
+                    raise ValueError("missing data")
+                return obj["data"]
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
                 logger.warning("YouGPU %s %s attempt %s/%s: %s: %s",
-                               method, path, index + 1, limit, type(exc).__name__, exc)
+                               method, path, index + 1, limit, type(exc).__name__, "network failure")
                 if index == limit - 1 or not is_get:
                     if is_get:
-                        raise ProviderError(f"YouGPU GET {path} failed: {type(exc).__name__}") from exc
+                        raise ProviderError(f"YouGPU: сеть недоступна ({type(exc).__name__}). Обновите состояние позже.", operation_id=operation_id) from exc
                     raise ProviderError(
-                        "YouGPU write outcome uncertain; check instance list before retrying"
+                        "Результат операции YouGPU неизвестен. Нажмите «Сверить статус»; повторная аренда запрещена.", operation_id=operation_id, uncertain=True
                     ) from exc
             except httpx.HTTPStatusError as exc:
                 code = exc.response.status_code
@@ -73,9 +87,9 @@ class YouGPU:
                 if is_get and code in (429, 500, 502, 503, 504) and index < limit - 1:
                     pass
                 else:
-                    raise ProviderError(f"YouGPU HTTP {code} for {method} {path}") from exc
-            except (httpx.InvalidURL, ValueError) as exc:
-                raise ProviderError(f"Invalid YouGPU response for {method} {path}: {exc}") from exc
+                    raise ProviderError(f"YouGPU HTTP {code}: запрос {method} {path} отклонён. Проверьте ключ, права и состояние в панели YouGPU.", status_code=code, operation_id=operation_id, uncertain=not is_get and code>=500) from exc
+            except (httpx.InvalidURL, ValueError, TypeError) as exc:
+                raise ProviderError(f"YouGPU вернул некорректный JSON/схему для {method} {path}.", operation_id=operation_id, uncertain=not is_get) from exc
             if index < limit - 1:
                 delay = min(0.5 * (2 ** index) + random.uniform(0, 0.2), 2.0)
                 if deadline is not None:
@@ -91,7 +105,7 @@ class YouGPU:
         try:
             count = int(offer.get("gpu_count") or 1)
             price = float(offer["price"])
-            if count < 1 or price < 0:
+            if count < 1 or price < 0 or not math.isfinite(price):
                 return None
             loc = offer.get("location") or {}
             provider = offer.get("provider") or {}
@@ -101,6 +115,8 @@ class YouGPU:
                 provider = {}
             return {
                 "id": offer["id"],
+                "in_stock": offer.get("in_stock") is True,
+                "stale": False,
                 "gpu": gpu["name"],
                 "gpu_count": count,
                 "vram_each": gpu["vram_gb"],
@@ -108,7 +124,7 @@ class YouGPU:
                 "disk": (offer.get("root_disk_gb") or 0) + (offer.get("ephemeral_disk_gb") or 0),
                 "hourly": price,
                 "currency": offer.get("currency") or "RUB",
-                "region": loc.get("name") or loc.get("slug") or "",
+                "region": offer.get("region") or loc.get("name") or loc.get("slug") or "",
                 "provider": provider.get("name") or "",
                 "images": offer.get("available_images") or [],
                 "checked_at": time.time(),
@@ -117,10 +133,10 @@ class YouGPU:
             logger.warning("Skipping malformed offer %s: %s", offer.get("id"), exc)
             return None
 
-    def catalog(self):
+    def catalog(self, refresh=False, require_live=False):
         now = time.time()
         with self._lock:
-            if self._cache is not None and now - self._cache_time < self.CATALOG_TTL:
+            if not refresh and self._cache is not None and now - self._cache_time < self.CATALOG_TTL:
                 return [dict(item) for item in self._cache]
 
         deadline = time.monotonic() + self.CATALOG_BUDGET
@@ -129,25 +145,23 @@ class YouGPU:
             if not isinstance(gpus, list):
                 raise ProviderError("YouGPU GPU catalog is not a list")
             available = [g for g in gpus if isinstance(g, dict) and
-                         int((g.get("stats") or {}).get("total_offers") or 0) > 0]
+                         g.get("id") and g.get("name")]
             results = []
             failed = []
-            for gpu in available:
-                if time.monotonic() >= deadline - 1:
-                    failed.append("time budget")
-                    break
-                try:
-                    offers = self.request("GET", "/catalog/offers/" + quote(str(gpu["id"]), safe=""),
-                                          deadline=deadline)
-                    if not isinstance(offers, list):
-                        raise ProviderError("GPU offers payload is not a list")
-                    for offer in offers:
-                        item = self._normalize(gpu, offer)
-                        if item is not None:
-                            results.append(item)
-                except (ProviderError, KeyError, TypeError, ValueError) as exc:
-                    failed.append(gpu.get("name", "unknown"))
-                    logger.warning("YouGPU offers unavailable for %s: %s", gpu.get("name"), exc)
+            def fetch_offers(gpu):
+                offers=self.request("GET", "/catalog/offers/"+quote(str(gpu["id"]),safe=""),deadline=deadline)
+                if not isinstance(offers,list):raise ProviderError("GPU offers payload is not a list")
+                return [item for offer in offers if (item:=self._normalize(gpu,offer)) is not None]
+            # Bounded concurrency prevents one slow GPU family from consuming the
+            # entire catalog budget before other families can be queried.
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                pending={pool.submit(fetch_offers,g):g for g in available}
+                for future in as_completed(pending):
+                    gpu=pending[future]
+                    try:results.extend(future.result())
+                    except (ProviderError,KeyError,TypeError,ValueError):
+                        failed.append(gpu.get("name","unknown"))
+                        logger.warning("YouGPU offers unavailable for %s",gpu.get("name"))
 
             # A partial catalog is usable for display; do not overwrite good cached
             # offers with an empty result caused by network failure.
@@ -156,24 +170,43 @@ class YouGPU:
                     self.__class__._cache = [dict(item) for item in results]
                     self.__class__._cache_time = time.time()
                 if failed:
+                    results=[{**x,"partial":True} for x in results]
                     logger.warning("YouGPU catalog partial: %s", ", ".join(failed))
                 return results
             raise ProviderError("YouGPU offers unavailable: " + ", ".join(failed))
         except ProviderError:
             with self._lock:
-                if self._cache is not None and time.time() - self._cache_time < self.STALE_TTL:
+                if not require_live and self._cache is not None and time.time() - self._cache_time < self.STALE_TTL:
                     logger.warning("Using cached YouGPU catalog due to provider failure")
-                    return [dict(item) for item in self._cache]
+                    return [{**item,"stale":True} for item in self._cache]
             raise
 
+    def balance(self):
+        value=self.request("GET", "/billing/balance")
+        if not isinstance(value,dict):raise ProviderError("Некорректный ответ баланса YouGPU")
+        try:
+            result={k:float(value[k]) for k in ("available","hourly_rate","pending","total")}
+            if not all(math.isfinite(v) for v in result.values()):raise ValueError()
+        except (KeyError,ValueError,TypeError):raise ProviderError("Неполный ответ баланса YouGPU")
+        return result
+
     def instances(self):
-        return self.request("GET", "/instances")
+        result=self.request("GET", "/instances")
+        if isinstance(result,dict):result=result.get("items")
+        if not isinstance(result,list) or any(not isinstance(x,dict) or not x.get("id") or not x.get("name") for x in result):
+            raise ProviderError("Неполный список инстансов YouGPU; сверка не выполнена")
+        return result
 
     def instance(self, id):
-        return self.request("GET", "/instances/" + quote(str(id), safe=""))
+        result=self.request("GET", "/instances/" + quote(str(id), safe=""))
+        if not isinstance(result,dict) or not result.get("status"):raise ProviderError("Неполное состояние инстанса YouGPU")
+        return result
 
     def create(self, payload):
-        return self.request("POST", "/instances", payload)
+        result=self.request("POST", "/instances", payload)
+        if not isinstance(result,dict) or not result.get("id"):
+            raise ProviderError("YouGPU не вернул ID: требуется сверка", uncertain=True)
+        return result
 
     def terminate(self, id):
         return self.request("POST", "/instances/" + quote(str(id), safe="") + "/terminate")

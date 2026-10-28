@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from PIL import Image, ImageOps
 from sqlalchemy import select
-from .db import Item, Dataset, Character, uid
+from .db import Item, Dataset, Character, KV, uid
 from .storage import sha_file
 
 IMAGE={'.png','.jpg','.jpeg','.webp'}
@@ -56,6 +56,25 @@ def import_zip(db,storage,dataset,path):
         # Validate all images and captions before committing any database changes.
         media=[i for i in members if Path(i.filename).suffix.lower() in IMAGE|VIDEO and not i.is_dir() and '__MACOSX' not in i.filename]
         names=set(z.namelist());known_groups={}
+        if len(names)!=len(members):raise ValueError('ZIP содержит повторяющиеся пути')
+        captions={}
+        for entry in members:
+            if entry.filename.endswith('metadata.jsonl') and not entry.is_dir():
+                parent=PurePosixPath(entry.filename).parent
+                for line in z.read(entry).decode('utf-8-sig').splitlines():
+                    if not line.strip():continue
+                    row=json.loads(line)
+                    if not isinstance(row,dict) or not isinstance(row.get('file_name'),str) or not isinstance(row.get('text'),str):
+                        raise ValueError('metadata.jsonl: требуется file_name и text (строки)')
+                    key=str(parent/row['file_name'])
+                    if key in captions and captions[key]!=row['text']:raise ValueError('Неоднозначные captions metadata.jsonl')
+                    captions[key]=row['text']
+        txt_by_stem={}
+        media_by_stem={}
+        for entry in members:
+            if entry.filename.endswith('.txt'):
+                txt_by_stem.setdefault(PurePosixPath(entry.filename).stem,[]).append(entry.filename)
+        for entry in media:media_by_stem.setdefault(PurePosixPath(entry.filename).stem,[]).append(entry.filename)
         if 'manifest.json' in names:
             manifest=json.loads(z.read('manifest.json'))
             known_groups={i.get('sha256'):i.get('group') for i in manifest.get('items',[]) if i.get('sha256') and i.get('group')}
@@ -69,7 +88,13 @@ def import_zip(db,storage,dataset,path):
                 if target.suffix in IMAGE:
                     with Image.open(target) as im:im.verify()
                 cp=str(Path(i.filename).with_suffix('.txt')).replace('\\','/')
-                caption=z.read(cp).decode('utf-8-sig')[:12000] if cp in names else ''
+                if cp not in names:
+                    candidates=txt_by_stem.get(PurePosixPath(i.filename).stem,[])
+                    if candidates and (len(candidates)!=1 or len(media_by_stem[PurePosixPath(i.filename).stem])!=1):
+                        raise ValueError('Неоднозначное соответствие изображений и отдельных captions: '+i.filename)
+                    cp=candidates[0] if candidates else None
+                caption=z.read(cp).decode('utf-8-sig')[:12000] if cp else captions.get(i.filename,'')[:12000]
+                if cp and i.filename in captions and caption!=captions[i.filename][:12000]:raise ValueError('TXT и metadata.jsonl содержат разные captions')
                 pending.append((target,i.filename,caption))
             for target,name,caption in pending:
                 item=ingest_file(db,storage,dataset,target,name,caption,known_groups.get(sha_file(target)))
@@ -100,4 +125,6 @@ def snapshot(db,storage,dataset,validation_ratio=0.15):
                 manifest.append({'id':i.id,'source_name':i.name,'sha256':i.sha,'group':i.group_id,'split':split,'kind':i.kind,'caption':i.caption})
             z.writestr(zipfile.ZipInfo('manifest.json',date_time=(2020,1,1,0,0,0)),json.dumps({'dataset_id':dataset.id,'revision':dataset.revision,'trigger':char.trigger,'items':manifest},ensure_ascii=False,indent=2))
         sha=sha_file(zp);key=f'snapshots/{dataset.id}/{sha}.zip';storage.put(zp,key)
+    record_key='snapshot:'+dataset.id+':'+sha[:40]
+    if not db.get(KV,record_key):db.add(KV(key=record_key,value={'key':key,'dataset_id':dataset.id,'revision':dataset.revision,'sha256':sha}))
     return {'key':key,'sha256':sha,'revision':dataset.revision,'train':sum(i['split']=='train' for i in manifest),'validation':len(items)-sum(i['split']=='train' for i in manifest),'kinds':sorted(set(i.kind for i in items))}

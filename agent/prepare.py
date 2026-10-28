@@ -20,6 +20,7 @@ def prepare(job,work):
         for n,item in enumerate(p['items']):
             file=download(item['url'],work/(item['id']+Path(item['name']).suffix))
             instruction='Write one factual English training caption. Include framing, pose, visible clothing, expression, lighting and surroundings. Do not invent identity or details. End with person_visible=yes/no and face_visible=yes/no.'
+            instruction+=' '+str(p.get('dataset_settings',{}).get('caption_rules',''))[:6000]
             sampled=item['kind']=='video'
             if sampled:
                 duration=float(probe_video(file)['format']['duration']);frames=[]
