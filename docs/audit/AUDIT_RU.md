@@ -57,4 +57,4 @@ DELETE требует `?confirm=true`, UI показывает подтверж�
 
 ## Публикация
 
-GitHub-интеграция создала удалённую ветку fix/studio-audit-yougpu, но операции create-tree и create-file получили HTTP 403 Resource not accessible by integration. Прямой git push не имеет HTTPS credentials. Поэтому удалённая ветка пока без исправлений, PR не создан. Локально подготовлены два коммита, patch и bundle для переноса. main не изменялся.
+Первоначальная публикация через GitHub-интеграцию была заблокирована HTTP 403 Resource not accessible by integration; прямой git push тогда не имел credentials. После предоставления пользователем отдельного токена ветка fix/studio-audit-yougpu успешно опубликована обычным git push, без интеграции. Создан PR: https://github.com/crystalcali/maymaystudio/pull/1 . main не изменялся. Токен не включался в исходники, remote URL, отчёты или коммиты.
