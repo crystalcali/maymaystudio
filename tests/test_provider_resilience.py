@@ -88,3 +88,12 @@ def test_partial_catalog_visible(monkeypatch):
     transport(monkeypatch,handler)
     o=YouGPU().catalog()[0]
     assert o['partial'] and not o['in_stock']
+
+
+def test_live_schema_missing_offer_stock_uses_complete_family_stats():
+    gpu={'name':'RTX 6000 Ada','vram_gb':48,'stats':{'in_stock_count':4,'total_offers':4}}
+    offer={'id':'live','price':'112.44703','available_images':[]}
+    assert YouGPU._normalize(gpu,offer)['in_stock'] is True
+    gpu['stats']['in_stock_count']=2
+    assert YouGPU._normalize(gpu,offer)['in_stock'] is None
+    assert YouGPU._normalize(gpu,{**offer,'in_stock':False})['in_stock'] is False

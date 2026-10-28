@@ -115,7 +115,9 @@ class YouGPU:
                 provider = {}
             return {
                 "id": offer["id"],
-                "in_stock": offer.get("in_stock") is True,
+                "in_stock": offer["in_stock"] if type(offer.get("in_stock")) is bool else (
+                    True if (gpu.get('stats') or {}).get('in_stock_count',0)>0 and
+                    (gpu.get('stats') or {}).get('in_stock_count')==(gpu.get('stats') or {}).get('total_offers') else None),
                 "stale": False,
                 "gpu": gpu["name"],
                 "gpu_count": count,
@@ -146,6 +148,8 @@ class YouGPU:
                 raise ProviderError("YouGPU GPU catalog is not a list")
             available = [g for g in gpus if isinstance(g, dict) and
                          g.get("id") and g.get("name")]
+            # Query families with known offers first; unknown stats are still queried.
+            available.sort(key=lambda g: (0 if (g.get('stats') or {}).get('in_stock_count',0) else 1,0 if (g.get('stats') or {}).get('total_offers',0) else 1))
             results = []
             failed = []
             def fetch_offers(gpu):
@@ -166,11 +170,12 @@ class YouGPU:
             # A partial catalog is usable for display; do not overwrite good cached
             # offers with an empty result caused by network failure.
             if results or (not available and not failed):
+                if failed:
+                    results=[{**x,"partial":True,"failed_families":failed} for x in results]
                 with self._lock:
                     self.__class__._cache = [dict(item) for item in results]
                     self.__class__._cache_time = time.time()
                 if failed:
-                    results=[{**x,"partial":True} for x in results]
                     logger.warning("YouGPU catalog partial: %s", ", ".join(failed))
                 return results
             raise ProviderError("YouGPU offers unavailable: " + ", ".join(failed))

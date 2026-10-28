@@ -472,7 +472,7 @@ def create_app(settings=None):
         return [{'offer_id':o['id'],**estimate(session,body['recipe'],params,o)} for o in app.state.catalog or []]
     @app.get('/api/resources/nodes',dependencies=[Depends(admin)])
     def nodes(session=Depends(db)):
-        return [{**asdict(n),'estimated_spend':round(n.hourly*max(0,(n.terminated or time.time())-n.created)/3600,2)} for n in session.scalars(select(Node).order_by(Node.created.desc()))]
+        return [{**asdict(n),'estimated_spend':round(n.hourly*max(0,(n.terminated or time.time())-n.created)/3600,2) if n.provider_id else None} for n in session.scalars(select(Node).where(Node.status!='archived').order_by(Node.created.desc()))]
     @app.post('/api/resources/rent',dependencies=[Depends(admin)])
     def rent(body:dict,session=Depends(db)):
         if not s.agent_image:raise ValueError('В Timeweb задайте AGENT_IMAGE — публичный образ GPU-агента из GitHub Packages, затем повторите деплой')
@@ -527,12 +527,31 @@ def create_app(settings=None):
         n=get_or_404(session,Node,id)
         active=session.scalar(select(Job).where(Job.node_id==id,Job.status.not_in(TERMINAL)))
         if active:raise ValueError('Cancel tasks and wait for confirmed artifact upload first')
-        if not n.provider_id:raise ValueError('Reconcile provider instance ID first')
+        if not n.provider_id:
+            # Read-only reconciliation before an explicitly requested termination.
+            node_refresh(id,session)
+        if n.status=='TERMINATED':return asdict(n)
         try:provider(session).terminate(n.provider_id)
         except ProviderError as exc:
             if exc.uncertain:n.status='reconcile_required';session.commit()
             raise
         n.status='TERMINATING';session.commit();return asdict(n)
+
+    @app.post('/api/resources/nodes/{id}/archive',dependencies=[Depends(admin)])
+    def node_archive(id:str,body:dict,session=Depends(db)):
+        n=get_or_404(session,Node,id)
+        if body.get('confirm') is not True:raise ValueError('Подтвердите архивирование записи. Это не команда завершения аренды')
+        if session.scalar(select(Job).where(Job.node_id==id,Job.status.not_in(TERMINAL))):raise ValueError('Сначала завершите активные задания')
+        if session.scalar(select(Worker).where(Worker.node_id==id,Worker.heartbeat>time.time()-120)):raise ValueError('Агент ещё подключён; сначала завершите аренду')
+        if n.provider_id:
+            result=provider(session).instance(n.provider_id)
+            if result['status']!='TERMINATED':raise ValueError('Инстанс ещё существует. Сначала завершите аренду и сверьте статус')
+        else:
+            matches=[x for x in provider(session).instances() if x['name']==n.name]
+            if matches:raise ValueError('Инстанс найден в YouGPU. Нажмите «Сверить статус», затем завершите аренду')
+        n.status='archived';n.auto_terminate=False
+        n.connection={**n.connection,'archive_note':'Запись скрыта после сверки; это не подтверждение остановки биллинга иных инстансов','archived_at':time.time()}
+        session.commit();return {'ok':True,'billing_action':False}
 
     # Worker API: scoped credentials + lease/attempt fencing. No global provider token is sent.
     @app.post('/worker/register')

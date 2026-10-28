@@ -121,3 +121,29 @@ def test_cancel_does_not_terminate_rental(client,app,monkeypatch):
     j=gen(client,node_id='paid')
     assert client.post('/api/jobs/'+j['id']+'/cancel').status_code==200
     assert client.get('/api/resources/nodes').json()[0]['status']=='ACTIVE'
+
+
+def test_archive_missing_rental_is_read_only(client,app,monkeypatch):
+    with app.state.Session.begin() as s:s.add(Node(id='old',name='old',request_id='old-request-123',status='reconcile_required',hourly=186))
+    monkeypatch.setattr(YouGPU,'instances',lambda self:[])
+    monkeypatch.setattr(YouGPU,'terminate',lambda *a:pytest.fail('Archive must not terminate'))
+    assert client.get('/api/resources/nodes').json()[0]['estimated_spend'] is None
+    assert client.post('/api/resources/nodes/old/archive',json={}).status_code==400
+    assert client.post('/api/resources/nodes/old/archive',json={'confirm':True}).json()['billing_action'] is False
+    assert client.get('/api/resources/nodes').json()==[]
+
+
+def test_archive_live_rental_refused(client,app,monkeypatch):
+    with app.state.Session.begin() as s:s.add(Node(id='old',name='old',request_id='old-request-123',status='reconcile_required'))
+    monkeypatch.setattr(YouGPU,'instances',lambda self:[{'id':'real','name':'old'}])
+    assert client.post('/api/resources/nodes/old/archive',json={'confirm':True}).status_code==400
+
+
+def test_terminate_resolves_missing_id(client,app,monkeypatch):
+    with app.state.Session.begin() as s:s.add(Node(id='old',name='old',request_id='old-request-123',status='reconcile_required'))
+    monkeypatch.setattr(YouGPU,'instances',lambda self:[{'id':'real','name':'old'}])
+    monkeypatch.setattr(YouGPU,'instance',lambda self,id:{'status':'ACTIVE'})
+    calls=[]
+    monkeypatch.setattr(YouGPU,'terminate',lambda self,id:calls.append(id))
+    assert client.post('/api/resources/nodes/old/terminate').status_code==200
+    assert calls==['real']
