@@ -77,6 +77,7 @@ def test_structured_provider_error(client,monkeypatch):
 
 def test_uncertain_rental_idempotency(client,app,monkeypatch):
     app.state.settings.agent_image='ghcr.io/example/agent:commit'
+    monkeypatch.setattr(YouGPU,'ssh_keys',lambda self:[{'id':'ssh-default','is_default':True}])
     offers=[{'id':'o','hourly':12,'in_stock':True,'gpu':'A100','images':[{'id':'os','supports_docker':True}]}]
     monkeypatch.setattr(YouGPU,'catalog',lambda self,**kw:offers)
     calls=[]
@@ -89,6 +90,7 @@ def test_uncertain_rental_idempotency(client,app,monkeypatch):
     n=client.post('/api/resources/rent',json=body).json()
     assert n['status']=='reconcile_required' and len(calls)==1
     assert calls[0]['instance_name']=='maymay-'+body['request_id']
+    assert calls[0]['ssh_keys']==['ssh-default']
     monkeypatch.setattr(YouGPU,'instances',lambda self:[{'id':'paid','name':calls[0]['instance_name']}])
     monkeypatch.setattr(YouGPU,'instance',lambda self,id:{'status':'ACTIVE'})
     assert client.post('/api/resources/nodes/'+n['id']+'/refresh').json()['provider_id']=='paid'
@@ -147,3 +149,19 @@ def test_terminate_resolves_missing_id(client,app,monkeypatch):
     monkeypatch.setattr(YouGPU,'terminate',lambda self,id:calls.append(id))
     assert client.post('/api/resources/nodes/old/terminate').status_code==200
     assert calls==['real']
+
+
+def test_rental_without_ssh_key_never_creates(client,app,monkeypatch):
+    app.state.settings.agent_image='ghcr.io/example/agent:test'
+    monkeypatch.setattr(YouGPU,'ssh_keys',lambda self:[])
+    monkeypatch.setattr(YouGPU,'create',lambda *a:pytest.fail('No paid request without SSH key'))
+    r=client.post('/api/resources/rent',json={'request_id':'no-key-request-123','offer_id':'o'})
+    assert r.status_code==400 and 'SSH' in r.json()['detail']
+
+
+def test_unknown_ssh_key_never_creates(client,app,monkeypatch):
+    app.state.settings.agent_image='ghcr.io/example/agent:test'
+    monkeypatch.setattr(YouGPU,'ssh_keys',lambda self:[{'id':'valid'}])
+    monkeypatch.setattr(YouGPU,'create',lambda *a:pytest.fail('No paid request with unknown SSH key'))
+    r=client.post('/api/resources/rent',json={'request_id':'bad-key-request-123','offer_id':'o','ssh_keys':['unknown']})
+    assert r.status_code==400

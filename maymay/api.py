@@ -461,6 +461,8 @@ def create_app(settings=None):
         if refresh or not app.state.catalog or time.time()-app.state.catalog_at>90:
             app.state.catalog=provider(session).catalog(refresh=refresh);app.state.catalog_at=time.time()
         return app.state.catalog
+    @app.get('/api/resources/ssh-keys',dependencies=[Depends(admin)])
+    def resource_ssh_keys(session=Depends(db)):return provider(session).ssh_keys()
     @app.get('/api/resources/balance',dependencies=[Depends(admin)])
     def balance(session=Depends(db)):return provider(session).balance()
     @app.post('/api/resources/estimate',dependencies=[Depends(admin)])
@@ -480,6 +482,11 @@ def create_app(settings=None):
         if not re.fullmatch(r'[a-zA-Z0-9-]{10,64}',request_id):raise ValueError('Unique request_id required')
         existing=session.scalar(select(Node).where(Node.request_id==request_id))
         if existing:return asdict(existing)
+        keys=provider(session).ssh_keys()
+        selected_keys=body.get('ssh_keys')
+        if selected_keys is None:selected_keys=[k['id'] for k in keys if k.get('is_default') is True]
+        if not isinstance(selected_keys,list) or not selected_keys or any(not isinstance(k,str) or k not in {x['id'] for x in keys} for k in selected_keys):
+            raise ValueError('Нужен зарегистрированный SSH-ключ YouGPU. Добавьте публичный ключ в панели YouGPU, затем выберите его в форме аренды. Запрос оплаты не отправлен')
         offers=provider(session).catalog(refresh=True,require_live=True);offer=next((o for o in offers if o['id']==body['offer_id']),None)
         if not offer or not offer.get('in_stock') or offer.get('stale'):raise ValueError('Предложение недоступно. Обновите каталог')
         limit=float(body.get('max_hourly',0))
@@ -499,7 +506,7 @@ def create_app(settings=None):
         n=Node(id=uid(),request_id=request_id,name='maymay-'+request_id,hourly=offer['hourly'],offer=offer,auto_terminate=bool(body.get('auto_terminate',False)),idle_minutes=max(5,int(body.get('idle_minutes',15))),budget=body.get('budget'))
         session.add(n);session.flush();pair=pairing(session,n.id,86400);session.commit()
         payload={'instance_name':n.name,'offer_id':offer['id'],'image_id':body.get('image_id') or images[0]['id'],
-            'ssh_keys':body.get('ssh_keys',[]),'docker_config':{'image':s.agent_image,'env':[{'key':'STUDIO_URL','value':s.public_url},{'key':'PAIRING_CODE','value':pair},{'key':'WORKER_NAME','value':n.name}], 'ports':[]}}
+            'ssh_keys':selected_keys,'docker_config':{'image':s.agent_image,'env':[{'key':'STUDIO_URL','value':s.public_url},{'key':'PAIRING_CODE','value':pair},{'key':'WORKER_NAME','value':n.name}], 'ports':[]}}
         if body.get('storage_drive_id'):payload['storage_drive_id']=body['storage_drive_id']
         try:
             result=provider(session).create(payload);n.provider_id=result['id'];n.status=result.get('status','PROVISIONING')

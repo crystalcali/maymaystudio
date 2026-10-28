@@ -186,6 +186,12 @@ class YouGPU:
                     return [{**item,"stale":True} for item in self._cache]
             raise
 
+    def ssh_keys(self):
+        result=self.request('GET','/ssh-keys')
+        if not isinstance(result,list) or any(not isinstance(x,dict) or not x.get('id') for x in result):
+            raise ProviderError('Некорректный список SSH-ключей YouGPU')
+        return [{k:x.get(k) for k in ('id','name','fingerprint','is_default')} for x in result]
+
     def balance(self):
         value=self.request("GET", "/billing/balance")
         if not isinstance(value,dict):raise ProviderError("Некорректный ответ баланса YouGPU")
