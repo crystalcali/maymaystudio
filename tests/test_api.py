@@ -13,7 +13,7 @@ from maymay.recipes import PROFILES
 
 @pytest.fixture
 def app(tmp_path):
-    return create_app(Settings(database_url='sqlite:///'+str(tmp_path/'db.sqlite'),data_dir=tmp_path/'objects',public_url='http://testserver'))
+    return create_app(Settings(compute_mode='legacy',database_url='sqlite:///'+str(tmp_path/'db.sqlite'),data_dir=tmp_path/'objects',public_url='http://testserver'))
 @pytest.fixture
 def client(app):
     with TestClient(app) as c:

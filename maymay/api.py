@@ -197,7 +197,7 @@ def create_app(settings=None):
         return report
     @app.get('/api/settings',dependencies=[Depends(admin)])
     def settings_view(session=Depends(db)):
-        return {'public_url':s.public_url,'agent_image':s.agent_image,'production':s.production,
+        return {'public_url':s.public_url,'agent_image':s.agent_image,'production':s.production,'compute_mode':s.compute_mode,
             'yougpu_connected':bool(session.get(KV,'yougpu') or os.getenv('YOUGPU_API_KEY')),
             'hf_connected':bool(session.get(KV,'huggingface') or os.getenv('HF_TOKEN')),
             'civitai_connected':bool(session.get(KV,'civitai') or os.getenv('CIVITAI_TOKEN'))}
@@ -452,7 +452,7 @@ def create_app(settings=None):
         return [{k:v for k,v in asdict(w).items() if k!='token_hash'}|{'online':w.heartbeat>time.time()-45} for w in session.scalars(select(Worker))]
     @app.post('/api/workers/pair',dependencies=[Depends(admin)])
     def pair_worker(session=Depends(db)):
-        raw=pairing(session);session.commit();return {'pairing_code':raw,'expires_in':900,'studio_url':s.public_url}
+        raw=pairing(session);session.commit();return {'pairing_code':raw,'expires_in':900,'studio_url':s.public_url,'agent_image':s.agent_image}
     @app.patch('/api/workers/{id}',dependencies=[Depends(admin)])
     def worker_edit(id:str,body:dict,session=Depends(db)):
         w=get_or_404(session,Worker,id);w.draining=bool(body.get('draining',w.draining));session.commit();return {'ok':True}
@@ -477,6 +477,7 @@ def create_app(settings=None):
         return [{**asdict(n),'estimated_spend':round(n.hourly*max(0,(n.terminated or time.time())-n.created)/3600,2) if n.provider_id else None} for n in session.scalars(select(Node).where(Node.status!='archived').order_by(Node.created.desc()))]
     @app.post('/api/resources/rent',dependencies=[Depends(admin)])
     def rent(body:dict,session=Depends(db)):
+        if s.compute_mode=='manual':raise HTTPException(410,'Аренда управляется вручную в панели YouGPU. Studio только подключает агента')
         if not s.agent_image:raise ValueError('В Timeweb задайте AGENT_IMAGE — публичный образ GPU-агента из GitHub Packages, затем повторите деплой')
         request_id=body.get('request_id','')
         if not re.fullmatch(r'[a-zA-Z0-9-]{10,64}',request_id):raise ValueError('Unique request_id required')
@@ -531,6 +532,7 @@ def create_app(settings=None):
         session.commit();return asdict(n)
     @app.post('/api/resources/nodes/{id}/terminate',dependencies=[Depends(admin)])
     def node_terminate(id:str,session=Depends(db)):
+        if s.compute_mode=='manual':raise HTTPException(410,'Аренда управляется вручную в панели YouGPU. Studio только подключает агента')
         n=get_or_404(session,Node,id)
         active=session.scalar(select(Job).where(Job.node_id==id,Job.status.not_in(TERMINAL)))
         if active:raise ValueError('Cancel tasks and wait for confirmed artifact upload first')
@@ -583,7 +585,7 @@ def create_app(settings=None):
         if busy:return {'job':None}
         if w.node_id:
             node=session.scalar(select(Node).where(Node.id==w.node_id).with_for_update())
-            if node and (node.status not in ('ACTIVE','INSTALLING','PROVISIONING','CREATING','STARTING','creating') or (node.budget and node.hourly*(time.time()-node.created)/3600>=node.budget)):
+            if node and (node.status not in ('ACTIVE','INSTALLING','PROVISIONING','CREATING','STARTING','creating') or (s.compute_mode=='legacy' and node.budget and node.hourly*(time.time()-node.created)/3600>=node.budget)):
                 locked.draining=True;session.commit();return {'job':None}
         available=w.capabilities.get('recipes',[])
         q=select(Job).where(Job.status=='queued',Job.recipe.in_(available),((Job.preferred_worker==None)|(Job.preferred_worker==w.id)),((Job.node_id==None)|(Job.node_id==w.node_id))).order_by(Job.created).with_for_update(skip_locked=True)
@@ -616,7 +618,7 @@ def create_app(settings=None):
         if body.get('log'):session.add(Log(job_id=j.id,text=redact(body['log'])[-12000:]))
         if j.node_id:
             node=session.get(Node,j.node_id)
-            if node and node.budget and node.hourly*(time.time()-node.created)/3600>=node.budget:
+            if s.compute_mode=='legacy' and node and node.budget and node.hourly*(time.time()-node.created)/3600>=node.budget:
                 j.status='cancelling';j.stage='Лимит расходов: сохраняем готовые файлы';session.get(Worker,w.id).draining=True
         session.commit();return {'cancel':j.status=='cancelling','lease_seconds':s.lease_seconds}
     @app.post('/worker/jobs/{id}/artifact/init')
@@ -726,6 +728,7 @@ def supervise_once(app):
         for j in db.scalars(select(Job).where(Job.status.in_(['running','cancelling']),Job.lease<now)):
             j.status='connection_lost';j.stage='Связь потеряна; автоматический повтор отключён'
         db.commit()
+        if s.compute_mode=='manual':return
         for candidate in db.scalars(select(Node).where(Node.auto_terminate==True,Node.terminated==None)).all():
             n=db.scalar(select(Node).where(Node.id==candidate.id).with_for_update().execution_options(populate_existing=True))
             if not n.provider_id or n.status in ('TERMINATING','reconcile_required','creating'):continue
