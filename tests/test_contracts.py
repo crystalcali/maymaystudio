@@ -44,10 +44,10 @@ def test_benchmark_settings_do_not_mix():
 
 def test_provider_payload_contract(monkeypatch):
     calls=[]
-    def request(self,method,path,payload=None):
+    def request(self,method,path,payload=None, **kwargs):
         calls.append((method,path,payload))
-        if path=='/catalog/gpus':return [{'id':'g','name':'A100','vram_gb':80}]
-        if path=='/catalog/offers/g':return [{'id':'offer','in_stock':True,'gpu_count':2,'ram_gb':240,'root_disk_gb':100,'ephemeral_disk_gb':500,'price':'123.45','available_images':[]}]
+        if path=='/catalog/gpus':return [{'id':'g','name':'A100','vram_gb':80, 'stats':{'total_offers': 1}}]
+        if path=='/catalog/offers/g':return [{'id':'offer','in_active':True,'gpu_count':2,'ram_gb':240,'root_disk_gb':100,'ephemeral_disk_gb':500,'price':'123.45','available_images':[]}]
         return {'id':'i'}
     monkeypatch.setattr(YouGPU,'request',request)
     p=YouGPU();offer=p.catalog()[0]
