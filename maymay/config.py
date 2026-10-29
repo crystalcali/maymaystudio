@@ -14,9 +14,11 @@ class Settings:
     s3_endpoint: str = os.getenv('S3_ENDPOINT_URL', '')
     s3_region: str = os.getenv('S3_REGION', 'ru-1')
     agent_image: str = os.getenv('AGENT_IMAGE', '')
+    compute_mode: str = os.getenv('COMPUTE_MODE','manual')
     lease_seconds: int = 120
     max_upload: int = int(os.getenv('MAX_UPLOAD_MB', '1024')) * 1024 * 1024
     def validate(self):
+        if self.compute_mode not in ('manual','legacy'):raise RuntimeError('COMPUTE_MODE: manual or legacy')
         if self.database_url.startswith('postgres://'):
             self.database_url = self.database_url.replace('postgres://','postgresql+psycopg://',1)
         if self.database_url.startswith('postgresql://'):

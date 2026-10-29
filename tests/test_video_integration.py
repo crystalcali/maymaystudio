@@ -35,7 +35,8 @@ def test_cpu_worker_full_roundtrip(tmp_path,monkeypatch):
             job=c.post('/api/jobs',json={'recipe':'dataset.video','params':{'dataset_id':ds['id'],'clip_seconds':1,'overlap':.25,'scene_cut':False}})
             assert job.status_code==200,job.text
             pair=c.post('/api/workers/pair').json()['pairing_code']
-            reg=c.post('/worker/register',json={'pairing_code':pair,'capabilities':{'gpu':'CPU','recipes':['dataset.video']}}).json()
+            # Exercise the real agent's unauthenticated registration transport.
+            reg=Studio(url).post('/worker/register',{'pairing_code':pair,'capabilities':{'gpu':'CPU','recipes':['dataset.video']}})
             api=Studio(url,reg['token']);claim=api.post('/worker/claim')['job']
             execute(api,claim,{},tmp_path/'worker')
             latest=c.get('/api/jobs').json()[0]

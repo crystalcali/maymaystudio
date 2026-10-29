@@ -21,7 +21,7 @@ class Studio:
     def __init__(self,url,secret=''):self.url=url.rstrip('/');self.secret=secret
     def post(self,path,body=None,**kwargs):
         with httpx.Client(timeout=45) as c:
-            r=c.post(self.url+path,json=body if not kwargs else None,headers={'Authorization':'Bearer '+self.secret},**kwargs)
+            r=c.post(self.url+path,json=body if not kwargs else None,headers=({'Authorization':'Bearer '+self.secret} if self.secret else {}),**kwargs)
         r.raise_for_status();return r.json()
 
 def hardware():
@@ -210,7 +210,16 @@ def main():
     else:
         api=Studio(url);pair=os.environ.get('PAIRING_CODE','')
         if not pair:raise RuntimeError('PAIRING_CODE required for first registration')
-        saved=api.post('/worker/register',{'pairing_code':pair,'name':os.getenv('WORKER_NAME','YouGPU worker'),'capabilities':hardware()})
+        # Retry startup only on failures known to precede a response; never
+        # repeat registration after a read timeout (one-use pairing may be consumed).
+        for startup_attempt in range(5):
+            try:
+                saved=api.post('/worker/register',{'pairing_code':pair,'name':os.getenv('WORKER_NAME','YouGPU worker'),'capabilities':hardware()})
+                break
+            except (httpx.ConnectError,httpx.ConnectTimeout):
+                if startup_attempt==4:raise
+                print('Регистрация: Studio недоступна; повтор подключения',flush=True)
+                time.sleep(min(2**startup_attempt,8))
         saved['studio_url']=url;credentials.write_text(json.dumps(saved));credentials.chmod(0o600)
     api=Studio(url,saved['token']);delay=2
     while True:
