@@ -28,6 +28,7 @@ from .provider import YouGPU, ProviderError
 from .preflight import inspect_components
 from .estimates import estimate
 
+from .caption_models import CAPTION_MODELS
 TERMINAL={'succeeded','cancelled','failed'}
 ACTIVE={'running','cancelling','connection_lost'}
 
@@ -264,12 +265,13 @@ def create_app(settings=None):
     @app.get('/api/datasets/{id}/settings',dependencies=[Depends(admin)])
     def dataset_settings(id:str,session=Depends(db)):
         d=get_or_404(session,Dataset,id);row=session.get(KV,'dataset-settings:'+id)
-        return {'material':'image','caption_rules':'Describe variable properties in English','resolution':1024,'selection':'manual','validation_ratio':.15,
+        return {'material':'image','caption_rules':'Describe variable properties in English','resolution':1024,'selection':'manual','validation_ratio':.15,'captioner':'Qwen/Qwen2.5-VL-3B-Instruct',
                 **(row.value if row else {}),'character_id':d.character_id,'trigger':session.get(Character,d.character_id).trigger}
     @app.put('/api/datasets/{id}/settings',dependencies=[Depends(admin)])
     def dataset_settings_save(id:str,body:dict,session=Depends(db)):
         get_or_404(session,Dataset,id);dataset_idle(session,id)
-        value={k:body[k] for k in ('material','caption_rules','resolution','selection','validation_ratio') if k in body}
+        value={k:body[k] for k in ('material','caption_rules','resolution','selection','validation_ratio','captioner') if k in body}
+        if value.get('captioner','Qwen/Qwen2.5-VL-3B-Instruct') not in CAPTION_MODELS:raise ValueError('Неизвестная модель автоописания')
         if value.get('material','image') not in ('image','video','mixed'):raise ValueError('Тип материала: image/video/mixed')
         if value.get('selection','manual') not in ('manual','exclude_duplicates'):raise ValueError('Неизвестная стратегия отбора')
         if not 0<=float(value.get('validation_ratio',.15))<=.5:raise ValueError('Validation split: 0–0.5')
@@ -403,13 +405,14 @@ def create_app(settings=None):
                     if old.params.get(k)!=params.get(k):raise ValueError('Resume configuration differs: '+k)
                 params['resume_key']=a.key
         if recipe['kind']=='prepare':
-            if rid=='dataset.caption':
-                report=inspect_components({'caption_model':{'repo':'Qwen/Qwen2.5-VL-3B-Instruct','revision':'main'}},get_secret(session,'huggingface',s.secret) or os.getenv('HF_TOKEN',''))
-                if not report['ok']:raise ValueError('Caption model access check failed')
-                params['caption_model']=report['components']['caption_model']['spec']
             ds=get_or_404(session,Dataset,params.get('dataset_id',''))
             if ds.character_id!=char.id:raise ValueError('Dataset belongs to another character')
             params['dataset_settings']=dataset_settings(ds.id,session)
+            if rid=='dataset.caption':
+                captioner=params['dataset_settings']['captioner']
+                report=inspect_components({'caption_model':{'repo':captioner,'revision':'main'}},get_secret(session,'huggingface',s.secret) or os.getenv('HF_TOKEN',''))
+                if not report['ok']:raise ValueError('Caption model access check failed')
+                params['caption_model']=report['components']['caption_model']['spec']
             items=session.scalars(select(Item).where(Item.dataset_id==ds.id)).all()
             params['items']=[{'id':i.id,'key':i.key,'name':i.name,'kind':i.kind,'group_id':i.group_id,'caption':i.caption} for i in items if rid=='dataset.caption' or i.kind=='video']
             if not params['items']:raise ValueError('No suitable items in dataset')

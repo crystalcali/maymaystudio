@@ -29,3 +29,17 @@
 Исправлена и первая регистрация: агент больше не отправляет пустой `Authorization: Bearer ` до получения worker token. Авторизация heartbeat, заданий и загрузки результатов сохранена.
 
 CPU-тесты проверяют контракт, повторную попытку, сохранность старого caption, границы датасетов и реальный HTTP-путь регистрации. Они не подтверждают GPU-качество описаний или сборку Docker.
+
+## Выбор модели (добавление)
+
+В настройках датасета доступен `huihui-ai/Qwen2.5-VL-7B-Instruct-abliterated` как экспериментальная альтернатива прежней 3B. Сервер выбирает repo из allowlist и фиксирует ревизию; произвольный caption_model из запроса не принимается как источник весов. На агенте используется тот же класс Qwen2_5_VLForConditionalGeneration, без trust_remote_code. Нужен новый GPU-образ. Существующие задачи сохраняют прежний pinned repo/revision.
+
+По карточке автора это uncensored-вариант, обработана только текстовая часть, не визуальная. Уменьшение отказов не доказывает точность captions. Проверяйте имена объектов, позы и движение на небольшом наборе. BF16-веса — около 16.6 GB, дополнительно нужна память под обработку изображений/видео; точный пик здесь не измерен.
+
+Кандидат для отдельного адаптера фото: fancyfeast/llama-joycaption-beta-one-hf-llava. Автор позиционирует JoyCaption как uncensored captioner для diffusion datasets, с SFW/NSFW покрытием. Это Llava, не Qwen: в текущем меню его нет, видео и JSON-контракт не квалифицированы. Сравните на одних исходниках до интеграции. Авторы отмечают возможные сбои и отдельные отказы; полное отсутствие отказов не обещается.
+
+Источники:
+- https://huggingface.co/huihui-ai/Qwen2.5-VL-7B-Instruct-abliterated
+- https://huggingface.co/huihui-ai/Qwen2.5-VL-7B-Instruct-abliterated/blob/main/config.json
+- https://huggingface.co/fancyfeast/llama-joycaption-beta-one-hf-llava
+- https://github.com/fpgaminer/joycaption

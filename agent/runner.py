@@ -47,7 +47,7 @@ def component(spec,cache):
         cached=try_to_load_from_cache(repo,file['name'],cache_dir=str(cache),revision=revision)
         if not isinstance(cached,str):missing_bytes+=int(file.get('bytes',0))
     if missing_bytes and shutil.disk_usage(cache).free<missing_bytes+5*1024**3:
-        raise RuntimeError(f'Not enough model disk space: need {missing_bytes/1024**3:.1f} GB plus 5 GB reserve')
+        raise RuntimeError(f'Недостаточно места на диске {cache}: свободно {shutil.disk_usage(cache).free/1024**3:.1f} GiB; нужно ещё {missing_bytes/1024**3:.1f} GiB + 5 GiB запаса. Подключите большой рабочий диск к /workspace (см. docs/STORAGE_RU.md). Видеопамять здесь не используется.')
     emit('Загрузка весов',component=repo)
     if spec.get('filename'):return hf_hub_download(repo_id=repo,filename=spec['filename'],revision=revision,cache_dir=str(cache))
     folder=spec.get('subfolder')

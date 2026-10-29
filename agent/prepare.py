@@ -14,7 +14,9 @@ def prepare(job,work):
         import torch
         from transformers import AutoProcessor,Qwen2_5_VLForConditionalGeneration
         from PIL import Image
-        model_id='Qwen/Qwen2.5-VL-3B-Instruct'
+        model_id=p['caption_model']['repo']
+        from maymay.caption_models import CAPTION_MODELS
+        if model_id not in CAPTION_MODELS:raise ValueError('Unsupported caption model')
         revision=p['caption_model']['revision']
         processor=AutoProcessor.from_pretrained(model_id,revision=revision,min_pixels=256*28*28,max_pixels=1024*28*28)
         model=Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id,revision=revision,torch_dtype=torch.bfloat16,device_map='auto')
