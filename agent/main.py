@@ -21,7 +21,7 @@ class Studio:
     def __init__(self,url,secret=''):self.url=url.rstrip('/');self.secret=secret
     def post(self,path,body=None,**kwargs):
         with httpx.Client(timeout=45) as c:
-            r=c.post(self.url+path,json=body if not kwargs else None,headers={'Authorization':'Bearer '+self.secret},**kwargs)
+            r=c.post(self.url+path,json=body if not kwargs else None,headers=({'Authorization':'Bearer '+self.secret} if self.secret else {}),**kwargs)
         r.raise_for_status();return r.json()
 
 def hardware():

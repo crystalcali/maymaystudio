@@ -3,6 +3,7 @@ import re
 import subprocess
 from pathlib import Path
 from .runner import download,emit
+from .captions import caption_instruction,checked_caption
 
 def probe_video(src):
     return json.loads(subprocess.check_output(['ffprobe','-v','error','-show_format','-show_streams','-of','json',str(src)]))
@@ -19,28 +20,40 @@ def prepare(job,work):
         model=Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id,revision=revision,torch_dtype=torch.bfloat16,device_map='auto')
         for n,item in enumerate(p['items']):
             file=download(item['url'],work/(item['id']+Path(item['name']).suffix))
-            instruction='Write one factual English training caption. Include framing, pose, visible clothing, expression, lighting and surroundings. Do not invent identity or details. End with person_visible=yes/no and face_visible=yes/no.'
-            instruction+=' '+str(p.get('dataset_settings',{}).get('caption_rules',''))[:6000]
             sampled=item['kind']=='video'
+            rules=p.get('dataset_settings',{}).get('caption_rules','')
+            instruction=caption_instruction(rules,video=sampled)
             if sampled:
                 duration=float(probe_video(file)['format']['duration']);frames=[]
                 for k in range(8):
                     image_path=work/f'{item["id"]}_sample{k}.png'
                     subprocess.run(['ffmpeg','-nostdin','-y','-ss',str(duration*(k+.5)/8),'-i',str(file),'-frames:v','1',str(image_path)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                     with Image.open(image_path) as im:frames.append(im.convert('RGB').copy())
-                messages=[{'role':'user','content':[{'type':'video','video':frames},{'type':'text','text':instruction+' Describe visible actions across these sampled video frames.'}]}]
-                text=processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
-                inputs=processor(text=[text],videos=[frames],videos_kwargs={'fps':8/max(duration,.1)},return_tensors='pt').to(model.device)
+                content=[{'type':'video','video':frames},{'type':'text','text':instruction}]
             else:
                 with Image.open(file) as im:image=im.convert('RGB').copy()
-                messages=[{'role':'user','content':[{'type':'image','image':image},{'type':'text','text':instruction}]}]
+                content=[{'type':'image','image':image},{'type':'text','text':instruction}]
+            def generate(attempt):
+                content[-1]['text']=caption_instruction(rules,video=sampled,retry=bool(attempt))
+                messages=[{'role':'user','content':content}]
                 text=processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
-                inputs=processor(text=[text],images=[image],return_tensors='pt').to(model.device)
-            with torch.inference_mode():ids=model.generate(**inputs,max_new_tokens=180,do_sample=False)
-            caption=processor.batch_decode(ids[:,inputs.input_ids.shape[1]:],skip_special_tokens=True)[0].strip()
-            lower=caption.lower();quality={'person_visible':True if 'person_visible=yes' in lower else False if 'person_visible=no' in lower else None,'face_visible':True if 'face_visible=yes' in lower else False if 'face_visible=no' in lower else None,'caption_review_required':True,'sampled_video_frames':8 if sampled else 0}
-            caption=re.split('person_visible=',caption,flags=re.I)[0].strip(' ,.;')
-            result['captions'].append({'id':item['id'],'caption':p['trigger']+', '+caption,'quality':quality})
+                if sampled:
+                    inputs=processor(text=[text],videos=[frames],videos_kwargs={'fps':8/max(duration,.1)},return_tensors='pt').to(model.device)
+                else:
+                    inputs=processor(text=[text],images=[image],return_tensors='pt').to(model.device)
+                with torch.inference_mode():ids=model.generate(**inputs,max_new_tokens=320,do_sample=False)
+                output=ids[:,inputs.input_ids.shape[1]:]
+                raw=processor.batch_decode(output,skip_special_tokens=True)[0].strip()
+                eos=model.generation_config.eos_token_id
+                eos_ids=eos if isinstance(eos,(list,tuple)) else [eos]
+                truncated=output.shape[1]>=320 and int(output[0,-1]) not in eos_ids
+                return raw,truncated
+            description=checked_caption(generate,p['trigger'])
+            description['quality'].update(sampled_video_frames=8 if sampled else 0,
+                caption_model=model_id,caption_model_revision=revision)
+            result['captions'].append({'id':item['id'],**description})
+            if description['quality']['caption_status']=='failed':
+                emit('Описание не прошло проверку: '+item['id']+' — '+description['quality']['caption_error'])
             emit('Описание материалов',progress=(n+1)/len(p['items']))
     else:
         duration=float(p.get('clip_seconds',3));overlap=float(p.get('overlap',.5));fps=int(p.get('fps',16));frames_only=bool(p.get('frames_only'));scene_cut=bool(p.get('scene_cut',True))

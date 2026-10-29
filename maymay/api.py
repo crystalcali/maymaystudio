@@ -287,7 +287,9 @@ def create_app(settings=None):
     @app.patch('/api/items/{id}',dependencies=[Depends(admin)])
     def item_edit(id:str,body:dict,session=Depends(db)):
         i=get_or_404(session,Item,id)
-        if 'caption' in body:i.caption=str(body['caption'])[:12000]
+        if 'caption' in body:
+            i.caption=str(body['caption'])[:12000]
+            i.quality={**i.quality,'caption_review_required':False,'caption_status':'edited','caption_error':''}
         if 'accepted' in body:i.accepted=bool(body['accepted'])
         if 'group_id' in body:i.group_id=str(body['group_id'])[:120]
         session.get(Dataset,i.dataset_id).revision+=1;session.commit();return asdict(i)
@@ -692,8 +694,14 @@ def create_app(settings=None):
         for result in body.get('captions',[]):
             item=session.get(Item,result['id'])
             if item and item.dataset_id==j.params.get('dataset_id'):
-                item.caption=str(result['caption'])[:12000];item.quality={**item.quality,**result.get('quality',{})};session.get(Dataset,item.dataset_id).revision+=1
+                # A failed caption attempt updates diagnostics, never destroys prior text.
+                if isinstance(result.get('caption'),str) and result['caption'].strip():
+                    item.caption=result['caption'][:12000]
+                item.quality={**item.quality,**result.get('quality',{})};session.get(Dataset,item.dataset_id).revision+=1
         j.status=status;j.stage={'succeeded':'Готово','cancelled':'Отменено','failed':'Ошибка'}[status];j.finished=time.time();j.error=redact(body.get('error',''))[:6000]
+        if status=='succeeded' and j.recipe=='dataset.caption':
+            failed=sum(r.get('quality',{}).get('caption_status')=='failed' for r in body.get('captions',[]))
+            if failed:j.stage=f'Нужна проверка описаний: {failed}'
         if status=='succeeded':j.progress=1
         m=body.get('benchmark')
         if m and status=='succeeded' and m.get('samples',0)>0:
