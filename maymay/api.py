@@ -97,7 +97,7 @@ def create_app(settings=None):
         return n
 
     with Session.begin() as session:
-        if not session.get(Character,'may'):
+        if not session.get(Character,'may') and not session.get(KV,'deleted-character:may'):
             session.add(Character(id='may',name='May',trigger='MayMay_model',description='35-year-old virtual woman. Identity is defined by original face and body anchors.'))
         for family,components in PROFILES.items():
             if not session.get(Profile,family):session.add(Profile(id=family,name=family,family=family,components=components))
@@ -153,6 +153,32 @@ def create_app(settings=None):
                 if a and Path(a.name).suffix.lower() not in IMAGE:raise ValueError('Anchor must be an image')
                 setattr(c,key,a.id if a else None)
         session.commit();return character_view(c,session)
+    def character_deletion(c,session):
+        datasets=session.scalar(select(func.count()).select_from(Dataset).where(Dataset.character_id==c.id))
+        adapters=session.scalar(select(func.count()).select_from(Adapter).where(Adapter.character_id==c.id))
+        jobs=session.scalars(select(Job).where(Job.character_id==c.id)).all()
+        active=sum(j.status not in TERMINAL for j in jobs)
+        blockers=[]
+        if active:blockers.append(f'Сначала отмените или завершите активные задачи: {active}')
+        if len(jobs)-active:blockers.append(f'Удалите связанные записи из истории задач: {len(jobs)-active}')
+        if datasets:blockers.append(f'Сначала удалите связанные датасеты: {datasets}')
+        if adapters:blockers.append(f'Сначала удалите связанные записи LoRA: {adapters}')
+        return {'id':c.id,'name':c.name,'can_delete':not blockers,'blockers':blockers,
+                'dependencies':{'datasets':datasets,'adapters':adapters,'active_jobs':active,'history_jobs':len(jobs)-active}}
+    @app.get('/api/characters/{id}/deletion',dependencies=[Depends(admin)])
+    def character_delete_preview(id:str,session=Depends(db)):
+        return character_deletion(get_or_404(session,Character,id),session)
+    @app.delete('/api/characters/{id}',dependencies=[Depends(admin)])
+    def character_delete(id:str,confirm:bool=False,session=Depends(db)):
+        c=get_or_404(session,Character,id)
+        if not confirm:raise ValueError('Подтвердите необратимое удаление персонажа')
+        plan=character_deletion(c,session)
+        if not plan['can_delete']:raise HTTPException(409,'; '.join(plan['blockers']))
+        # Retain reference bytes and immutable snapshots; neither belongs exclusively
+        # to the card. Remember deletion of the seeded May across application restarts.
+        if id=='may' and not session.get(KV,'deleted-character:may'):
+            session.add(KV(key='deleted-character:may',value={'deleted':True}))
+        session.delete(c);session.commit();return {'ok':True,'objects_retained':True}
     @app.get('/api/profiles',dependencies=[Depends(admin)])
     def profiles(session=Depends(db)):return [asdict(x) for x in session.scalars(select(Profile))]
     @app.put('/api/profiles/{id}',dependencies=[Depends(admin)])
@@ -211,6 +237,7 @@ def create_app(settings=None):
     @app.post('/api/adapters',dependencies=[Depends(admin)])
     def adapter_create(body:dict,session=Depends(db)):
         family=body.get('family');source=str(body.get('source',''))
+        if body.get('character_id'):get_or_404(session,Character,body['character_id'])
         if family not in PROFILES:raise ValueError('Select adapter family')
         if source.startswith('https://'):
             host=urlparse(source).hostname
